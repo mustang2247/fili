@@ -10,6 +10,14 @@ Current
 
 ### Added:
 
+- [Refactor ApiRequest](https://github.com/yahoo/fili/pull/538)
+    * Add inteface layer to each type of API request class. The types of API request under the refactor are
+        - `TablesApiRequest`
+        - `DimensionApiRequest`
+        - `SlicesApiRequest`
+        - `MetricsApiRequest`
+        - `JobsApiRequest`
+
 - [Documentation that `Dimension::getFieldByName` should throw an `IllegalArgumentException` if there is no field with the passed in name](https://github.com/yahoo/fili/pull/547)
 
 - [Evaluate format type from both URI and Accept header](https://github.com/yahoo/fili/pull/495)
