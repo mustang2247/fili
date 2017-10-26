@@ -3,7 +3,12 @@
 package com.yahoo.bard.webservice.web.endpoints;
 
 import static com.yahoo.bard.webservice.config.BardFeatureFlag.UPDATED_METADATA_COLLECTION_NAMES;
+
+import static java.util.AbstractMap.SimpleImmutableEntry;
+
+import static javax.ws.rs.core.Response.Status.BAD_REQUEST;
 import static javax.ws.rs.core.Response.Status.INTERNAL_SERVER_ERROR;
+import static javax.ws.rs.core.Response.Status.OK;
 
 import com.yahoo.bard.webservice.application.ObjectMappersSuite;
 import com.yahoo.bard.webservice.data.config.ResourceDictionaries;
@@ -14,7 +19,9 @@ import com.yahoo.bard.webservice.logging.blocks.TableRequest;
 import com.yahoo.bard.webservice.table.LogicalTable;
 import com.yahoo.bard.webservice.table.LogicalTableDictionary;
 import com.yahoo.bard.webservice.table.PhysicalTable;
+import com.yahoo.bard.webservice.table.resolver.QueryPlanningConstraint;
 import com.yahoo.bard.webservice.util.SimplifiedIntervalList;
+import com.yahoo.bard.webservice.web.ErrorMessageFormat;
 import com.yahoo.bard.webservice.web.RequestMapper;
 import com.yahoo.bard.webservice.web.RequestValidationException;
 import com.yahoo.bard.webservice.web.ResponseFormatResolver;
@@ -34,6 +41,7 @@ import org.slf4j.LoggerFactory;
 import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
@@ -54,6 +62,7 @@ import javax.ws.rs.QueryParam;
 import javax.ws.rs.container.ContainerRequestContext;
 import javax.ws.rs.core.Context;
 import javax.ws.rs.core.MediaType;
+import javax.ws.rs.core.PathSegment;
 import javax.ws.rs.core.Response;
 import javax.ws.rs.core.UriInfo;
 
@@ -194,7 +203,7 @@ public class TablesServlet extends EndpointServlet implements BardConfigResource
             LOG.debug(e.getMessage(), e);
             responseSender = () -> Response.status(e.getStatus()).entity(e.getErrorHttpMsg()).build();
         } catch (Error | Exception e) {
-            String msg = String.format("Exception processing request: %s", e.getMessage());
+            String msg = ErrorMessageFormat.REQUEST_PROCESSING_EXCEPTION.format(e.getMessage());
             LOG.info(msg, e);
             responseSender = () -> Response.status(Response.Status.BAD_REQUEST).entity(msg).build();
         } finally {
@@ -205,7 +214,11 @@ public class TablesServlet extends EndpointServlet implements BardConfigResource
     }
 
     /**
-     * Get the logical table details for a grain-specific logical table.
+     * Get <b>unconstrained</b> logical table details for a grain-specific logical table.
+     * <p>
+     * See {@link
+     * #getTableByGrainAndConstraint(String, String, List, String, String, String, UriInfo, ContainerRequestContext)}
+     * for getting <b>constrained</b> logical table details
      *
      * @param tableName  Logical table name (part of the logical table ID)
      * @param grain  Logical table grain (part of the logical table ID)
@@ -214,6 +227,8 @@ public class TablesServlet extends EndpointServlet implements BardConfigResource
      *
      * @return The grain-specific logical table
      * @see TablesServlet#getLogicalTableFullView(LogicalTable, UriInfo)
+     *
+     * TODO: Need to delegate to constrained endpoint
      */
     @GET
     @Timed
@@ -244,7 +259,7 @@ public class TablesServlet extends EndpointServlet implements BardConfigResource
                 apiRequest = (TablesApiRequest) requestMapper.apply(apiRequest, containerRequestContext);
             }
 
-            Map<String, Object> result = getLogicalTableFullView(apiRequest, uriInfo);
+            Map<String, Object> result = getLogicalTableFullView(apiRequest.getTable(), uriInfo);
             String output = objectMappers.getMapper().writeValueAsString(result);
             LOG.debug("Tables Endpoint Response: {}", output);
             responseSender = () ->  Response.status(Response.Status.OK).entity(output).build();
@@ -252,13 +267,105 @@ public class TablesServlet extends EndpointServlet implements BardConfigResource
             LOG.debug(e.getMessage(), e);
             responseSender = () ->   Response.status(e.getStatus()).entity(e.getErrorHttpMsg()).build();
         } catch (JsonProcessingException e) {
-            String msg = String.format("Internal server error. JsonProcessingException : %s", e.getMessage());
+            String msg = ErrorMessageFormat.INTERNAL_SERVER_ERROR_ON_JSON_PROCESSING.format(e.getMessage());
             LOG.error(msg, e);
             responseSender = () -> Response.status(INTERNAL_SERVER_ERROR).entity(msg).build();
         } catch (Error | Exception e) {
-            String msg = String.format("Exception processing request: %s", e.getMessage());
+            String msg = ErrorMessageFormat.REQUEST_PROCESSING_EXCEPTION.format(e.getMessage());
             LOG.info(msg, e);
             responseSender = () -> Response.status(Response.Status.BAD_REQUEST).entity(msg).build();
+        } finally {
+            RequestLog.stopTiming(this);
+        }
+
+        return responseSender.get();
+    }
+
+    /**
+     * Get <b>constrained</b> logical table details for a grain-specific logical table.
+     * <p>
+     * An example query to this endpoint is
+     * <pre>
+     *     {@code
+     *     /tables/myTable/week/dim1/dim2?metrics=myMetric&filters=dim3|id-in[foo,bar]
+     *     }
+     * </pre>
+     * TODO: filter physical tables by interval and filter clause, i.e. "filters=dim3|id-in[foo,bar]".
+     * This query has an optional list of path separated grouping dimensions, an optional list of metrics, and an
+     * optional filter clause.
+     * <p>
+     * The query would result in a table response with the metrics, dimensions, and available intervals restricted down
+     * to the set of items that are still "reachable" given the constraints in the query (dim1, dim2, dim3, and
+     * myMetric, in this case). So, if the table normally indicates that dim7 is one of it's dimensions, but there isn't
+     * a backing physical table for myTable that has dim1, dim2, dim3, and myMetric along with dim7, then dim7 would not
+     * be in the dimension list returned in the response.
+     *
+     * @param tableName  Logical table name
+     * @param granularity  Logical table grain (part of the logical table ID)
+     * @param dimensions  Requested list of dimensions (e.g. dim1, dim2)
+     * @param metrics  Requested list of metrics (e.g. myMetric)
+     * @param intervals  Requested list of intervals. This is a required
+     * @param filters  Requested list of filters (e.g. dim3|id-in[foo,bar])
+     * @param uriInfo  UriInfo of the request
+     * @param containerRequestContext  The context of data provided by the Jersey container for this request
+     *
+     * @return The grain-specific logical table
+     *
+     * See {@link #getLogicalTableFullView(TablesApiRequest, UriInfo)}
+     */
+    @GET
+    @Timed
+    @Produces(MediaType.APPLICATION_JSON)
+    @Path("/{tableName}/{granularity}/{dimensions:.*}")
+    public Response getTableByGrainAndConstraint(
+            @PathParam("tableName") String tableName,
+            @PathParam("granularity") String granularity,
+            @PathParam("dimensions") List<PathSegment> dimensions,
+            @QueryParam("metrics") String metrics,
+            @QueryParam("dateTime") String intervals,
+            @QueryParam("filters") String filters,
+            @Context UriInfo uriInfo,
+            @Context final ContainerRequestContext containerRequestContext
+    ) {
+        Supplier<Response> responseSender;
+        try {
+            RequestLog.startTiming(this);
+            RequestLog.record(new TableRequest(tableName, granularity));
+
+            TablesApiRequest tablesApiRequest = new TablesApiRequest(
+                    tableName,
+                    granularity,
+                    null,
+                    "",
+                    "",
+                    uriInfo,
+                    this,
+                    dimensions,
+                    metrics,
+                    intervals,
+                    filters,
+                    null
+            );
+
+            if (requestMapper != null) {
+                tablesApiRequest = (TablesApiRequest) requestMapper.apply(tablesApiRequest, containerRequestContext);
+            }
+
+            Map<String, Object> result = getLogicalTableFullView(tablesApiRequest, uriInfo);
+            String output = objectMappers.getMapper().writeValueAsString(result);
+            LOG.debug("Tables Endpoint Response: {}", output);
+            responseSender = () ->  Response.status(OK).entity(output).build();
+        } catch (RequestValidationException exception) {
+            LOG.debug(exception.getMessage(), exception);
+            responseSender = () ->   Response.status(exception.getStatus()).entity(exception.getErrorHttpMsg()).build();
+        } catch (JsonProcessingException exception) {
+            String message = ErrorMessageFormat.INTERNAL_SERVER_ERROR_ON_JSON_PROCESSING.format(exception.getMessage());
+            LOG.error(message, exception);
+            responseSender = () -> Response.status(INTERNAL_SERVER_ERROR).entity(message).build();
+        } catch (Error | Exception exception) {
+            String message = ErrorMessageFormat.REQUEST_PROCESSING_EXCEPTION.format(exception.getMessage());
+            LOG.info(message, exception);
+            responseSender = () -> Response.status(BAD_REQUEST).entity(message).build();
         } finally {
             RequestLog.stopTiming(this);
         }
@@ -312,7 +419,7 @@ public class TablesServlet extends EndpointServlet implements BardConfigResource
             LOG.debug("Tables Endpoint Response: {}", response.getEntity());
             responseSender = () -> response;
         } catch (Error | Exception e) {
-            String msg = String.format("Exception processing request: %s", e.getMessage());
+            String msg = ErrorMessageFormat.REQUEST_PROCESSING_EXCEPTION.format(e.getMessage());
             LOG.info(msg, e);
             responseSender = () -> Response.status(Response.Status.BAD_REQUEST).entity(msg).build();
         } finally {
@@ -418,13 +525,45 @@ public class TablesServlet extends EndpointServlet implements BardConfigResource
     /**
      * Get the full view of the logical table.
      *
-     * @param apiRequest  Logical table to get the view of
+     * @param tablesApiRequest  Table API request that contains information about requested logical table and provides
+     * components for constructing a {@link com.yahoo.bard.webservice.table.resolver.QueryPlanningConstraint}, which
+     * will be used to filter and constrain table availabilities
      * @param uriInfo  UriInfo of the request
      *
      * @return Full view of the logical table
      */
-    protected static Map<String, Object> getLogicalTableFullView(TablesApiRequest apiRequest, UriInfo uriInfo) {
-        return getLogicalTableFullView(apiRequest.getTable(), uriInfo);
+    protected static Map<String, Object> getLogicalTableFullView(TablesApiRequest tablesApiRequest, UriInfo uriInfo) {
+        LogicalTable logicalTable = tablesApiRequest.getTable();
+        return Stream.of(
+                new SimpleImmutableEntry<>("category", logicalTable.getCategory()),
+                new SimpleImmutableEntry<>("name", logicalTable.getName()),
+                new SimpleImmutableEntry<>("longName", logicalTable.getLongName()),
+                new SimpleImmutableEntry<>("retention", logicalTable.getRetention().toString()),
+                new SimpleImmutableEntry<>("granularity", logicalTable.getGranularity().getName()),
+                new SimpleImmutableEntry<>("description", logicalTable.getDescription()),
+                new SimpleImmutableEntry<>(
+                        "dimensions",
+                        DimensionsServlet.getDimensionListSummaryView(logicalTable.getDimensions(), uriInfo)
+                ),
+                new SimpleImmutableEntry<>(
+                        "metrics",
+                        MetricsServlet.getLogicalMetricListSummaryView(logicalTable.getLogicalMetrics(), uriInfo)
+                ),
+                new SimpleImmutableEntry<>(
+                        "availableIntervals",
+                        getConstrainedLogicalTableAvailability(
+                                logicalTable,
+                                new QueryPlanningConstraint(tablesApiRequest)
+                        )
+                )
+        ).collect(
+                Collectors.toMap(
+                        SimpleImmutableEntry::getKey,
+                        SimpleImmutableEntry::getValue,
+                        (value1OfSameKey, value2OfSameKey) -> value1OfSameKey,
+                        LinkedHashMap::new
+                )
+        );
     }
 
     /**
@@ -492,5 +631,23 @@ public class TablesServlet extends EndpointServlet implements BardConfigResource
 
     public LogicalTableDictionary getLogicalTableDictionary() {
         return resourceDictionaries.getLogicalDictionary();
+    }
+
+    /**
+     * Returns union of constrained availabilities of constrained logical table.
+     *
+     * @param logicalTable  The constrained logical table
+     * @param queryPlanningConstraint  The constraint
+     *
+     * @return the union of constrained availabilities of constrained logical table
+     */
+    private static SimplifiedIntervalList getConstrainedLogicalTableAvailability(
+            LogicalTable logicalTable,
+            QueryPlanningConstraint queryPlanningConstraint
+    ) {
+        return logicalTable.getTableGroup().getPhysicalTables().stream()
+                .map(physicalTable -> physicalTable.withConstraint(queryPlanningConstraint))
+                .map(PhysicalTable::getAvailableIntervals)
+                .reduce(new SimplifiedIntervalList(), SimplifiedIntervalList::union);
     }
 }

@@ -11,6 +11,7 @@ import com.yahoo.bard.webservice.data.metric.MetricDictionary;
 import com.yahoo.bard.webservice.logging.RequestLog;
 import com.yahoo.bard.webservice.logging.blocks.MetricRequest;
 import com.yahoo.bard.webservice.table.LogicalTableDictionary;
+import com.yahoo.bard.webservice.web.ErrorMessageFormat;
 import com.yahoo.bard.webservice.web.MetricsApiRequest;
 import com.yahoo.bard.webservice.web.RequestMapper;
 import com.yahoo.bard.webservice.web.RequestValidationException;
@@ -150,7 +151,7 @@ public class MetricsServlet extends EndpointServlet {
             LOG.error(msg, e);
             responseSender = () -> Response.status(INTERNAL_SERVER_ERROR).entity(msg).build();
         } catch (Error | Exception e) {
-            String msg = String.format("Exception processing request: %s", e.getMessage());
+            String msg = ErrorMessageFormat.REQUEST_PROCESSING_EXCEPTION.format(e.getMessage());
             LOG.info(msg, e);
             responseSender = () -> Response.status(Response.Status.BAD_REQUEST).entity(msg).build();
         } finally {
@@ -207,7 +208,7 @@ public class MetricsServlet extends EndpointServlet {
             LOG.error(msg, e);
             responseSender = () -> Response.status(INTERNAL_SERVER_ERROR).entity(msg).build();
         } catch (Error | Exception e) {
-            String msg = String.format("Exception processing request: %s", e.getMessage());
+            String msg = ErrorMessageFormat.REQUEST_PROCESSING_EXCEPTION.format(e.getMessage());
             LOG.info(msg, e);
             responseSender = () -> Response.status(Response.Status.BAD_REQUEST).entity(msg).build();
         } finally {
